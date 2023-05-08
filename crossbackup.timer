@@ -1,0 +1,9 @@
+[Unit]
+Description=Schedule crossbackup service
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

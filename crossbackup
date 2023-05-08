@@ -1,0 +1,715 @@
+#! /usr/bin/perl -w -CD
+use strict;
+use warnings;
+use utf8;
+use Time::Local qw( timelocal_posix timegm_posix );
+use File::Basename;
+use YAML ();
+
+#load backup conf #
+my %backups = %{YAML::LoadFile("/etc/crossbackup.conf")};
+
+
+####################################################
+
+#######
+# log #
+#######
+
+# verbose ? #
+my $verboseLog; 
+
+if( defined($ARGV[0]) && $ARGV[0] eq "-v" ) {
+   $verboseLog = "true";
+}
+
+
+# if not verbose, open log file #
+my $backupLogFilePath = "/var/log/crossbackup.log";
+my $backupLogFile;
+
+if( ! $verboseLog ) {
+   open($backupLogFile, ">>", $backupLogFilePath) or die("Failed to open log file $backupLogFilePath !\n"); 
+}
+
+
+# to display dates # 
+sub dateToDateStr {
+
+   my ($date) = @_;
+
+   my ($sec,$min,$hour,$day,$month,$year) = localtime($date);
+   $month +=  1;
+   $year += 1900;
+
+   return sprintf("%04d%02d%02d%02d%02d%02d", $year, $month, $day, $hour, $min, $sec);
+}
+
+sub getCurrentDateStr {
+
+   return dateToDateStr(time());
+}
+
+# log message #
+sub logMsg {
+   
+   my ($msg) = @_;
+   my $date = getCurrentDateStr(); 
+
+   if( $verboseLog ) {   
+      print("BACKUP:-> $msg\n");
+   } else {
+      print $backupLogFile "$date : $msg\n";
+   }
+}
+
+# log message on error #
+# must avert admin #
+sub logCriticalMsg {
+
+   my ($msg) = @_;
+   logMsg($msg);
+}
+
+
+# rsync verbose opt #
+my $rsyncVerboseOpt = "";
+if( $verboseLog ) {
+   $rsyncVerboseOpt = "-v";
+}
+
+
+##########################################################
+
+
+# add ssh to command if needed #
+sub buildShellCommand {
+
+   my ($hostName, $cmd) = @_;
+
+   if( $hostName ne "localhost" ) {
+      return "ssh $backups{hosts}{$hostName}{backupUserName}" . "@" . "$hostName $cmd";
+   } else {
+      return "$cmd";
+   }
+}
+
+
+# check host connectivity #
+# and check backup disk mounted #
+sub checkHosts {
+
+   # for each host #
+   foreach my $hostName (keys %{$backups{hosts}}) {
+
+      # build command #
+      my $checkCommand = buildShellCommand($hostName, "mount | grep -q 'on $backups{hosts}{$hostName}{backupPath}'");
+
+      # run command #
+      system($checkCommand);
+      if( $? != 0 ) {
+         logCriticalMsg("Error : bad connectivity on host $hostName or non mounted backup partition $backups{hosts}{$hostName}{backupPath} !");
+         exit 1;
+      }
+   }
+}
+
+
+sub isHostNodeIncremental {
+
+  my ($hostName, $nodeName) = @_;
+
+  if( defined($backups{hosts}{$hostName}{nodes}{$nodeName}{type}) &&
+      $backups{hosts}{$hostName}{nodes}{$nodeName}{type} eq "replica" ) {
+     return undef;
+  }
+
+  return 1;
+}
+
+
+# create backup directory for each node #
+sub createBackupNodeDirectories {
+
+   # for each host #
+   foreach my $hostName (keys %{$backups{hosts}}) {
+
+      # for each node of each host #
+      foreach my $nodeHostName (keys %{$backups{hosts}}) {
+         foreach my $nodeName (keys %{$backups{hosts}{$nodeHostName}{nodes}}) {
+
+            # get the node backup path #
+            my $nodeBackupPath = "$backups{hosts}{$hostName}{backupPath}/$backups{hosts}{$nodeHostName}{backupDirName}/$nodeName";
+
+            # check the directory to create : replica or incremental #
+            my $nodeCreateDirectory;
+            if( ! isHostNodeIncremental($nodeHostName, $nodeName) ) {
+
+               # useless to create replica directory for the host himself 
+               if( $hostName eq $nodeHostName ) {
+                  $nodeCreateDirectory = "";
+               } else {
+                  $nodeCreateDirectory = "/full";
+               }
+
+            } else {
+
+               # incremental backup directory #
+               $nodeCreateDirectory = "/incremental";
+            }
+
+            # build command for creating incremental backup directory #
+            my $cmd = buildShellCommand($hostName, "mkdir -p '${nodeBackupPath}${nodeCreateDirectory}'");
+
+            # execute #
+            system($cmd);
+            if( $? != 0 ) {
+               logCriticalMsg("Error ! cannot create backup directories ${nodeBackupPath}${nodeCreateDirectory} on host $hostName !");
+               exit 1;
+            }
+
+            # if localhost create exclude file #
+            if( $hostName eq "localhost" ) {
+
+               # save path #
+               $backups{hosts}{$nodeHostName}{nodes}{$nodeName}{localhostBackupPath} = $nodeBackupPath;
+
+               open(my $excludeFile, ">", "$nodeBackupPath/exclude.txt") or die("Cannot write exclude file $nodeBackupPath/exclude.txt !");
+               foreach my $excludeStr (@{$backups{hosts}{$nodeHostName}{nodes}{$nodeName}{exclude}}) {
+                  print $excludeFile "$excludeStr\n";
+               }
+               close($excludeFile);
+            }
+         }
+      }
+   }
+}
+
+
+# create replicas on localhost with rsync #
+sub createReplicas {
+
+   #################
+   # for each host #
+   #################
+   foreach my $hostName (keys %{$backups{hosts}}) {
+
+      # not localhost #
+      if( $hostName eq "localhost" ) {
+         next;
+      }
+
+      ##############################
+      # for each nodes of the host #
+      ##############################
+      foreach my $nodeName (keys %{$backups{hosts}{$hostName}{nodes}}) {
+
+         # get backup path already generated #
+         my $nodeBackupPath = $backups{hosts}{$hostName}{nodes}{$nodeName}{localhostBackupPath};
+
+         #########
+         # rsync #
+         #########
+
+         # on macos we need some special option #
+         my $specialRsynOpt = "";
+         if( $backups{hosts}{$hostName}{os} eq "macos" ) {
+            $specialRsynOpt = "--iconv=utf-8,utf-8-mac --rsync-path '/usr/bin/caffeinate -s sudo /opt/local/bin/rsync'"
+         }
+
+         # get source address #
+         my $rsyncSrcHost = "$backups{hosts}{$hostName}{backupUserName}" . "@" . "$hostName";
+         my $rsyncSrcPath = "$backups{hosts}{$hostName}{nodes}{$nodeName}{path}/";
+         my $rsyncDstPath = "$nodeBackupPath/full";
+
+         # run rsync #
+         logMsg("Syncing host=$hostName node=$nodeName to localhost.");
+         my $rsyncCmd = "systemd-inhibit /usr/bin/rsync $rsyncVerboseOpt -a --delete --exclude-from '$nodeBackupPath/exclude.txt' $specialRsynOpt $rsyncSrcHost:$rsyncSrcPath $rsyncDstPath";
+         system("$rsyncCmd\n");
+         if( $? != 0 ) {
+            logCriticalMsg("Error ! rsync fail from $rsyncSrcHost:$rsyncSrcPath to $rsyncDstPath !");
+            exit 1;
+         }
+      }
+   }
+}
+
+logMsg("---------------");
+logMsg("Backup started.");
+checkHosts();
+createBackupNodeDirectories();
+createReplicas();
+
+
+##########################################################################################
+
+
+######################
+# incremental backup #
+######################
+
+# compute incremental level parameters #
+my %incLevels;
+my $maxLevel = scalar(@{$backups{levels}}) - 1;
+
+$incLevels{max} = $maxLevel;
+
+# compute level periods in seconds #
+my $currentLevel = $incLevels{max};
+my $currentPeriod = $backups{baseUnit};
+
+foreach my $levelPeriod (@{$backups{levels}}) {
+   $currentPeriod = $currentPeriod * $levelPeriod;
+   $incLevels{$currentLevel}{period} = $currentPeriod;
+   $currentLevel = $currentLevel - 1;
+}
+
+# compute level retention in seconds #
+$currentLevel = $incLevels{max};
+foreach my $levelRetention (@{$backups{retentions}}) {
+   $incLevels{$currentLevel}{retention} = $levelRetention * $backups{baseUnit};
+   $currentLevel = $currentLevel - 1;
+}
+
+
+sub dateStrToDate {
+
+   my ($dateStr) = @_;
+
+   if ( $dateStr eq "00000000000000" ) {
+      return 0;
+   }
+
+   my $year = substr($dateStr, 0, 4);
+   $year -= 1900;
+   my $month = substr($dateStr, 4, 2);
+   $month -= 1;
+   my $day = substr($dateStr, 6, 2);
+   my $hour = substr($dateStr, 8, 2);
+   my $min = substr($dateStr, 10, 2);
+   my $sec = substr($dateStr, 12, 2);
+
+   return timelocal_posix($sec, $min, $hour, $day, $month, $year);
+}
+
+
+sub getBackupFileInfo {
+
+   my ($filePath) = @_;
+
+   my %fileInfo;
+
+   # save path #
+   $fileInfo{path} = $filePath;
+
+   # get file name #
+   my $fileName = basename($filePath);
+   $fileInfo{name} = $fileName;
+
+   # get dates #
+   if( $fileName =~ m/^backup_(\d{14})_(\d{14})_lev(\d)\.tar/ ) {
+      
+      my $backupDateStr = $1;
+      my $backupReferenceDate = $2;
+      $fileInfo{level} = $3;
+      $fileInfo{backupDateStr} = $backupDateStr;
+      $fileInfo{backupDate} = dateStrToDate($backupDateStr);
+      $fileInfo{referenceDateStr} = $backupReferenceDate;
+      $fileInfo{referenceDate} = dateStrToDate($backupReferenceDate);
+   }
+
+   return \%fileInfo;
+} 
+
+# order backup file list and keep only level less or equal #
+sub orderBackupFileList {
+
+   my ($fileList, $level) = @_;
+
+   # keep only levels less or equal #
+   my @selectedFiles = grep { $_->{level} <= $level } @$fileList;
+
+   # sort by date #
+   my @sortedFiles = sort { $b->{backupDate} <=> $a->{backupDate} } @selectedFiles;
+
+   return \@sortedFiles;
+}
+ 
+
+# get the last file with level less or equal #
+sub getLastBackupFile {
+
+   my ($fileList, $level) = @_;
+
+   if( @$fileList == 0 ) {
+      return;
+   }
+
+   # order file list by date and select by level #
+   my $orderedBackupFileList = orderBackupFileList($fileList, $level);
+
+   return $orderedBackupFileList->[0];
+}
+
+
+# get the list of backup files for each node #
+sub loadNodeBackupFileList {
+
+   # for each host #
+   foreach my $hostName (keys %{$backups{hosts}}) {
+
+      # for each nodes of the host #
+      foreach my $nodeName (keys %{$backups{hosts}{$hostName}{nodes}}) {
+
+         # check if incremental #
+         if( ! isHostNodeIncremental($hostName, $nodeName) ) {
+             next;
+         }
+
+         # get incremental backup path #
+         my $incBackupPath = "$backups{hosts}{$hostName}{nodes}{$nodeName}{localhostBackupPath}/incremental";
+
+         # create list of backup file #
+         my @backupFileList;
+
+         opendir(my $incBackupDir, $incBackupPath) or die("Cannot open backup directory $incBackupPath ! \n");
+         while( my $backupFileName = readdir($incBackupDir) ) {
+
+            # get only tar files #
+            if( $backupFileName =~ m/^backup_(\d{14})_(\d{14})_lev(\d)\.tar/ ) {
+               push @backupFileList, getBackupFileInfo("$incBackupPath/$backupFileName");
+            }
+         }
+         closedir($incBackupDir);
+
+         # save #
+         $backups{hosts}{$hostName}{nodes}{$nodeName}{fileList} = \@backupFileList;
+      }
+   }
+}
+
+
+loadNodeBackupFileList();
+
+
+###############################################################
+
+
+#####################
+# start using times #
+#####################
+
+my $currentDate = time();
+my $currentDateStr = dateToDateStr($currentDate);
+
+
+# make a backup at a specific level #
+sub incrementalLevelBackup {
+
+   my ($hostName, $nodeName, $level) = @_;
+
+   # check if node is incremental #
+   if( ! isHostNodeIncremental($hostName, $nodeName) ) {
+      return;
+   }
+
+   # get backup path and file list #
+   my $backupPath = $backups{hosts}{$hostName}{nodes}{$nodeName}{localhostBackupPath};
+   my $backupFileList = $backups{hosts}{$hostName}{nodes}{$nodeName}{fileList};
+
+   # get backup dir #
+   # node path or replica #
+   my $backupDir;
+   if($hostName eq "localhost") {
+      $backupDir = $backups{hosts}{$hostName}{nodes}{$nodeName}{path};
+   } else {
+      $backupDir = "$backupPath/full";
+   }
+
+   ###########################
+   # need a reference file ? #
+   ###########################
+   if ( ($level == 0) ||
+        (@$backupFileList == 0) ) {
+
+      # create a level 0 backup without reference #
+      $level = 0;
+      my $referenceDateStr = "00000000000000";
+      my $backupFileName = "backup_${currentDateStr}_${referenceDateStr}_lev${level}";
+      
+      logMsg("Creating an incremental backup for host $hostName and node $nodeName at level $level.");
+      if( $verboseLog ) {
+         logMsg("systemd-inhibit /bin/tar -C '$backupDir' -czpf '$backupPath/incremental/$backupFileName.tar.gz' --exclude-from '$backupPath/exclude.txt' --listed-incremental='$backupPath/incremental/$backupFileName.snar' . ");
+      }
+      system("systemd-inhibit /bin/tar -C '$backupDir' -czpf '$backupPath/incremental/$backupFileName.tar.gz' --exclude-from '$backupPath/exclude.txt' --listed-incremental='$backupPath/incremental/$backupFileName.snar' . ");
+      if( ! ($? == 0 || ($? >> 8) == 1) ) {
+         logCriticalMsg("Error ! failed to create backup $backupPath/incremental/$backupFileName.tar.gz !");
+         system("rm -f '$backupPath/incremental/$backupFileName.tar.gz'");
+         system("rm -f '$backupPath/incremental/$backupFileName.snar'");
+         exit 1;
+      }
+   }
+
+   else {
+
+      # get the reference file to use #
+      my $referenceFile = getLastBackupFile($backupFileList, $level);
+
+      # generate file name #
+      my $referenceDateStr = $referenceFile->{backupDateStr};
+      my $referenceFileName = $referenceFile->{name};
+      $referenceFileName =~ s/\.tar\..*$//;
+
+      my $backupFileName = "backup_${currentDateStr}_${referenceDateStr}_lev${level}";
+
+      # copy the incremental file #
+      system("cp '$backupPath/incremental/$referenceFileName.snar' '$backupPath/incremental/$backupFileName.snar'");
+
+      # create the backup #
+      logMsg("Creating an incremental backup for host $hostName and node $nodeName at level $level");
+      if( $verboseLog ) {
+         logMsg("systemd-inhibit /bin/tar -C '$backupDir' -czpf '$backupPath/incremental/$backupFileName.tar.gz' --exclude-from '$backupPath/exclude.txt' --listed-incremental='$backupPath/incremental/$backupFileName.snar' . ");
+      }
+      system("systemd-inhibit /bin/tar -C '$backupDir' -czpf '$backupPath/incremental/$backupFileName.tar.gz' --exclude-from '$backupPath/exclude.txt' --listed-incremental='$backupPath/incremental/$backupFileName.snar' . ");
+      if( ! ($? == 0 || ($? >> 8) == 1) ) {
+         logCriticalMsg("Error ! failed to create backup $backupPath/incremental/$backupFileName.tar.gz !");
+         system("rm -f '$backupPath/incremental/$backupFileName.tar.gz'");
+         system("rm -r '$backupPath/incremental/$backupFileName.snar'");
+         exit 1;
+      }
+   }
+} 
+
+
+# create an incremental backup level #
+# level is choosen from elapsed time #
+sub incrementalBackup {
+
+   my ($hostName, $nodeName) = @_;
+
+   # check if node is incremental #
+   if( ! isHostNodeIncremental($hostName, $nodeName) ) {
+      return;
+   }
+
+   #####################################
+   # seach level based on elapsed time #
+   #####################################
+
+   # get file list #
+   my $backupFileList = $backups{hosts}{$hostName}{nodes}{$nodeName}{fileList};
+
+   # start with level 0 #
+   my $currentLevel = 0;
+
+   # if the list is not empty, analyse preceding backups #
+   if( @$backupFileList != 0 ) { 
+
+      while( $currentLevel <= $maxLevel ) {
+
+         # get level period #
+         my $levelPeriod = $incLevels{$currentLevel}{period};
+
+         # get last backup at this level #
+         my $lastBackupFile = getLastBackupFile($backupFileList, $currentLevel);
+
+         # compute epased time with baseUnit/2 precision #
+         my $elapsedTime = int($backups{baseUnit} / 2);
+         $elapsedTime += $currentDate - $lastBackupFile->{backupDate};
+
+         # check period #
+         if( $elapsedTime > $levelPeriod ) {
+            last;
+         }
+
+         # next level #
+         $currentLevel += 1;
+     }
+   }
+
+   # check if a backup is needed #
+   if( $currentLevel <= $maxLevel ) {
+      incrementalLevelBackup($hostName, $nodeName, $currentLevel);
+   }
+}
+
+
+# clean incremental backup based on retentions #
+sub cleanIncrementalBackup {
+
+   my ($hostName, $nodeName) = @_;
+
+   # check if node is incremental #
+   if( ! isHostNodeIncremental($hostName, $nodeName) ) {
+      return;
+   }
+
+   # get backup file list #
+   my $backupFileList = $backups{hosts}{$hostName}{nodes}{$nodeName}{fileList};
+
+   # if the list is empty, nothing to do  #
+   if( @$backupFileList == 0 ) {
+      return;
+   }
+
+   # sort the list by date #
+   my $orderedBackupFileList = orderBackupFileList($backupFileList, $maxLevel);
+
+   ###########################################
+   # check retention starting from max level #
+   ###########################################
+
+   # to store level status #
+   my %levelState;
+
+   foreach my $backupFile (@$orderedBackupFileList) {
+
+      #######################################
+      # check if we need to delete the file #
+      #######################################
+
+      # check the retention of the current file #
+      my $backupFileLevel = $backupFile->{level};
+      my $backupFileElapsedTime = $currentDate - $backupFile->{backupDate};
+      if( $backupFileElapsedTime > $incLevels{$backupFileLevel}{retention} ) {
+
+         # check if the file will be used as reference #
+         my $fileUsedAsReference = "false";
+         my $currentUpperLevel = $backupFileLevel + 1;
+         while( $currentUpperLevel <= $maxLevel ) {
+            if( defined($levelState{$currentUpperLevel}) and $levelState{$currentUpperLevel} eq "wait" ) {
+               $fileUsedAsReference = "true";
+               last;
+            }
+            $currentUpperLevel += 1;
+         }
+
+         # if not, we can delete #
+         if( $fileUsedAsReference eq "false" ) {
+            logMsg("Backup file $backupFile->{path} is not needed anymore.");
+            next;
+         }
+      }
+
+      ###########################################
+      # the file is not deleted, updates states #
+      ###########################################
+
+      # if level is non 0, wait for reference #
+      if( $backupFileLevel != 0 ) {
+         $levelState{$backupFileLevel} = "wait";
+      }
+
+      # check if this file can be used as reference for upper levels #
+      my $currentUpperLevel = $backupFileLevel + 1;
+      while( $currentUpperLevel <= $maxLevel ) {
+         if( defined($levelState{$currentUpperLevel}) and $levelState{$currentUpperLevel} eq "wait" ) {
+            $levelState{$currentUpperLevel} = "ok";
+         }
+         $currentUpperLevel += 1; 
+      }
+   }
+}
+
+
+# run all backups #
+sub fullBackup {
+
+   # for each host #
+   foreach my $hostName (keys %{$backups{hosts}}) {
+
+      # for each nodes of the host #
+      foreach my $nodeName (keys %{$backups{hosts}{$hostName}{nodes}}) {
+
+         # backup if needed #
+         if( isHostNodeIncremental($hostName, $nodeName) ) {
+            incrementalBackup($hostName, $nodeName);
+            cleanIncrementalBackup($hostName, $nodeName);
+         }
+      }
+   }
+}
+
+
+fullBackup();
+
+
+##############################################################
+
+
+############################
+# now send localhost nodes #
+############################
+
+sub sendLocalhostNodes {
+
+   # for each nodes of localhost #
+   foreach my $nodeName (keys %{$backups{hosts}{"localhost"}{nodes}}) {
+
+      # check we have a target host #
+      my $targetHost;
+      if( defined($backups{hosts}{"localhost"}{nodes}{$nodeName}{targetHost}) ) {
+         $targetHost = $backups{hosts}{"localhost"}{nodes}{$nodeName}{targetHost};
+      }
+
+      else {
+
+         my @hosts = grep { $_ ne "localhost" } keys(%{$backups{hosts}});
+         if( @hosts == 1 ) {
+            $targetHost = $hosts[0];
+         }
+      }
+
+      if( (! defined($targetHost)) ||
+          (! defined($backups{hosts}{$targetHost})) ) {
+          logCriticalMsg("Error ! Cannot find target host for host localhost and node $nodeName !");
+          exit 1;
+      }
+
+      # on macos we need some special option #
+      my $specialRsynOpt = "";
+      if( $backups{hosts}{$targetHost}{os} eq "macos" ) {
+         $specialRsynOpt = "--iconv=utf-8,utf-8-mac --rsync-path '/usr/bin/caffeinate -s sudo /opt/local/bin/rsync'";
+      }
+
+      # get node type and source #
+      my $nodeBackupPath = "$backups{hosts}{'localhost'}{backupPath}/$backups{hosts}{'localhost'}{backupDirName}/$nodeName";
+      my $nodeDir;
+      my $excludeOpt = "";
+      my $srcPath;
+      if( isHostNodeIncremental("localhost", $nodeName) ) {
+         $nodeDir = "incremental";
+         $srcPath = "$nodeBackupPath/incremental";
+      } else {
+         $nodeDir = "full";
+         $srcPath = $backups{hosts}{"localhost"}{nodes}{$nodeName}{path};
+         $excludeOpt = "--exclude-from '$nodeBackupPath/exclude.txt'";
+      }
+
+      # get dest path #
+      my $destPath = "$backups{hosts}{$targetHost}{backupPath}/$backups{hosts}{'localhost'}{backupDirName}/$nodeName/$nodeDir";
+      my $rsyncDestHost = "$backups{hosts}{$targetHost}{backupUserName}" . "@" . "$targetHost";
+
+      # build rsync command #
+      logMsg("Syncing host=localhost node=$nodeName to host $targetHost.");
+      my $rsyncCmd = "systemd-inhibit /usr/bin/rsync $rsyncVerboseOpt -a --delete $excludeOpt $specialRsynOpt '$srcPath/' '$rsyncDestHost:$destPath' ";
+      system("$rsyncCmd");
+      if( $? != 0 ) {
+         logCriticalMsg("Error ! rsync fail while syncing $srcPath/ to $rsyncDestHost:$destPath !");
+         exit 1;
+      }
+   }
+}
+
+
+sendLocalhostNodes();
+
+##########
+# done ! #
+##########
+my $endDate = time();
+my $backupDuration = $endDate - $currentDate;
+
+logMsg("Backup ended successfully in $backupDuration seconds !");
+logMsg("---------------");
+

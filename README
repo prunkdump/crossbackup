@@ -1,0 +1,36 @@
+On MacOs, install rsync with MacPorts
+
+And add binary to sudoers.
+sudo nano -w /private/etc/sudoers.d/rsync
+username ALL= NOPASSWD:/opt/local/bin/rsync
+sudo visudo -c
+
+On MacOs, create a disk sparsebundle, APFS, case sesnsitive
+Mount the disk at /Volumes/Backup
+
+see: https://gist.github.com/scottsb/479bebe8b4b86bf17e2d
+
+
+Create : /Library/LaunchDaemons/system.Backup.mount.plist
+!!! Change Bundle location
+
+<plist version="1.0">
+    <dict>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>Label</key>
+        <string>system.Backup.mount</string>
+        <key>ProgramArguments</key>
+        <array>
+            <string>hdiutil</string>
+            <string>attach</string>
+            <string>-notremovable</string>
+            <string>-nobrowse</string>
+            <string>-owners</string>
+            <string>on</string>
+            <string>-mountpoint</string>
+            <string>/Volumes/Backup</string>
+            <string><BUNDLE LOCATION PATH></string>
+        </array>
+    </dict>
+</plist>

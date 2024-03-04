@@ -586,7 +586,8 @@ sub cleanIncrementalBackup {
 
          # if not, we can delete #
          if( $fileUsedAsReference eq "false" ) {
-            logMsg("Backup file $backupFile->{path} is not needed anymore.");
+            logMsg("Backup file $backupFile->{path} is not needed anymore. Deleting...");
+            unlink($backupFile->{path});
             next;
          }
       }
